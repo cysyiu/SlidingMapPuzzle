@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Map Sliding Puzzle</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://html2canvas.hertzen.com/dist/html2canvas.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { 
+            height: 100%; width: 100%; overflow-x: hidden; 
+            font-family: Arial, sans-serif; background: #f8f9fa; 
+            touch-action: manipulation;
+        }
+        header { 
+            padding: 15px 10px; background: #2c3e50; color: white; text-align: center; 
+        }
+        #map-container {
+            width: 100%;
+            height: 60vh;
+            max-height: 700px;
+            margin: 10px auto;
+            padding: 0 10px;
+        }
+        #map { 
+            height: 100%; width: 100%; 
+            border: 3px solid #333; border-radius: 8px; 
+            overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+        }
+        #controls { 
+            padding: 12px 10px; text-align: center; 
+        }
+        button { 
+            padding: 10px 30px; font-size: 16px; cursor: pointer; 
+            background: #27ae60; color: white; border: none; border-radius: 6px;
+            margin: 6px 4px;
+        }
+        button:hover, button:active { background: #219653; }
+        button:disabled { background: #95a5a6; cursor: not-allowed; }
+        select {
+            padding: 10px 16px;
+            font-size: 16px;
+            border-radius: 6px;
+            margin: 6px 4px;
+        }
+        #timer { 
+            font-size: 24px; font-weight: bold; color: #e74c3c; margin: 10px 0;
+        }
+        #message { 
+            font-size: 16px; color: #34495e; min-height: 24px; padding: 0 10px;
+        }
+        @media (orientation: landscape) and (max-height: 500px) {
+            #map-container { height: 75vh; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h2>Map Sliding Puzzle</h2>
+        <p><small>Slide tiles into the empty space</small></p>
+    </header>
+
+    <div id="map-container">
+        <div id="map"></div>
+    </div>
+
+    <div id="controls">
+        <div>
+            <label for="gridSize">Grid size: </label>
+            <select id="gridSize">
+                <option value="3" selected>3×3</option>
+                <option value="4">4×4</option>
+                <option value="5">5×5</option>
+            </select>
+        </div>
+        <button id="start">Start Game</button>
+        <div id="timer">Time: —</div>
+        <div id="message"></div>
+    </div>
+
+    <script>
+        const map = L.map('map', {
+            center: [22.36, 114.13],
+            zoom: 8,
+            zoomControl: true,
+            attributionControl: false
+        });
+
+        L.tileLayer('https://mapapi.geodata.gov.hk/gs/api/v1.0.0/xyz/basemap/wgs84/{z}/{x}/{y}.png', {
+            minZoom: 10,
+            attribution: '© Hong Kong Geodata'
+        }).addTo(map);
+
+        L.tileLayer('https://mapapi.geodata.gov.hk/gs/api/v1.0.0/xyz/label/hk/en/wgs84/{z}/{x}/{y}.png', {
+            minZoom: 10,
+            attribution: '© Hong Kong Geodata'
+        }).addTo(map);
+
+        let timerInterval;
+        let gameActive = false;
+        let pieces = [];
+        let clickRects = [];
+        let greyOverlay = null;
+        let emptyIndex;
+        let gridBounds = [];
+        let gridSize = 3; // default
+
+        function lockMap() {
+            map.dragging.disable();
+            map.touchZoom.disable();
+            map.doubleClickZoom.disable();
+            map.scrollWheelZoom.disable();
+            map.boxZoom.disable();
+            map.keyboard.disable();
+            map.zoomControl.remove();
+        }
+
+        function unlockMap() {
+            map.dragging.enable();
+            map.touchZoom.enable();
+            map.doubleClickZoom.enable();
+            map.scrollWheelZoom.enable();
+            map.boxZoom.enable();
+            map.keyboard.enable();
+            map.zoomControl.addTo(map);
+        }
+
+        function createGreyscaleCanvas(sourceCanvas) {
+            const canvas = document.createElement('canvas');
+            canvas.width = sourceCanvas.width;
+            canvas.height = sourceCanvas.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(sourceCanvas, 0, 0);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            for (let i = 0; i < data.length; i += 4) {
+                const avg = (data[i] + data[i+1] + data[i+2]) / 3;
+                data[i] = data[i+1] = data[i+2] = avg;
+            }
+            ctx.putImageData(imageData, 0, 0);
+            return canvas.toDataURL('image/png');
+        }
+
+        function getAdjacent(pos, size) {
+            const row = Math.floor(pos / size);
+            const col = pos % size;
+            const adj = [];
+            if (row > 0) adj.push(pos - size);
+            if (row < size-1) adj.push(pos + size);
+            if (col > 0) adj.push(pos - 1);
+            if (col < size-1) adj.push(pos + 1);
+            return adj;
+        }
+
+        function isAdjacent(a, b, size) {
+            return getAdjacent(a, size).includes(b);
+        }
+
+        // Check solvability using inversion count + blank row (for N×N sliding puzzle)
+        function isSolvable(tiles, size, blankPos) {
+            let inversions = 0;
+            const flat = tiles.filter(t => t !== -1);
+
+            for (let i = 0; i < flat.length; i++) {
+                for (let j = i + 1; j < flat.length; j++) {
+                    if (flat[i] > flat[j]) inversions++;
+                }
+            }
+
+            const blankRowFromBottom = size - Math.floor(blankPos / size) - 1;
+
+            // For odd size: just inversions even
+            // For even size: inversions + blank row from bottom even
+            if (size % 2 === 1) {
+                return inversions % 2 === 0;
+            } else {
+                return (inversions + blankRowFromBottom) % 2 === 0;
+            }
+        }
+
+        document.getElementById('start').addEventListener('click', () => {
+            if (gameActive) return;
+
+            gridSize = parseInt(document.getElementById('gridSize').value);
+            const size = gridSize;
+            const totalTiles = size * size;
+
+            gameActive = true;
+            document.getElementById('message').textContent = '';
+            document.getElementById('start').disabled = true;
+            document.getElementById('start').textContent = "Game Running...";
+            document.getElementById('gridSize').disabled = true;
+
+            lockMap();
+
+            // Cleanup previous game
+            pieces.forEach(p => { if (p.overlay) map.removeLayer(p.overlay); });
+            clickRects.forEach(r => map.removeLayer(r));
+            if (greyOverlay) map.removeLayer(greyOverlay);
+            pieces = [];
+            clickRects = [];
+            greyOverlay = null;
+
+            const bounds = map.getBounds();
+            const south = bounds.getSouth();
+            const north = bounds.getNorth();
+            const west = bounds.getWest();
+            const east = bounds.getEast();
+
+            const dLat = (north - south) / size;
+            const dLng = (east - west) / size;
+
+            gridBounds = [];
+            for (let row = 0; row < size; row++) {
+                for (let col = 0; col < size; col++) {
+                    const sw = L.latLng(south + row * dLat, west + col * dLng);
+                    const ne = L.latLng(south + (row + 1) * dLat, west + (col + 1) * dLng);
+                    gridBounds.push(L.latLngBounds(sw, ne));
+                }
+            }
+
+            html2canvas(document.getElementById('map'), {
+                useCORS: true,
+                allowTaint: true,
+                logging: false,
+                scale: window.devicePixelRatio || 1.5
+            }).then(canvas => {
+                const fullBounds = map.getBounds();
+                const greyUrl = createGreyscaleCanvas(canvas);
+                greyOverlay = L.imageOverlay(greyUrl, fullBounds, {
+                    opacity: 1.0,
+                    interactive: false
+                }).addTo(map);
+
+                const cw = canvas.width / size;
+                const ch = canvas.height / size;
+                const tileImages = [];
+
+                for (let r = 0; r < size; r++) {
+                    for (let c = 0; c < size; c++) {
+                        const tc = document.createElement('canvas');
+                        tc.width = cw;
+                        tc.height = ch;
+                        tc.getContext('2d').drawImage(canvas, c*cw, r*ch, cw, ch, 0,0,cw,ch);
+                        tileImages.push(tc.toDataURL('image/png'));
+                    }
+                }
+
+                // Create tiles (0 to totalTiles-2), -1 = blank
+                let tileAtPos = Array(totalTiles).fill(-1);
+                for (let i = 0; i < totalTiles-1; i++) tileAtPos[i] = i;
+                emptyIndex = totalTiles - 1;
+
+                // Shuffle until solvable
+                do {
+                    // Fisher-Yates shuffle
+                    for (let i = totalTiles - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [tileAtPos[i], tileAtPos[j]] = [tileAtPos[j], tileAtPos[i]];
+                    }
+                    // Find new blank position
+                    emptyIndex = tileAtPos.indexOf(-1);
+                } while (!isSolvable(tileAtPos, size, emptyIndex));
+
+                // Create overlays
+                pieces = [];
+                for (let correct = 0; correct < totalTiles-1; correct++) {
+                    for (let pos = 0; pos < totalTiles; pos++) {
+                        if (tileAtPos[pos] === correct) {
+                            const overlay = L.imageOverlay(tileImages[correct], gridBounds[pos], {
+                                opacity: 1.0,
+                                interactive: false
+                            }).addTo(map);
+                            pieces.push({
+                                overlay,
+                                currentIndex: pos,
+                                correctIndex: correct
+                            });
+                            break;
+                        }
+                    }
+                }
+
+                // Clickable rectangles
+                clickRects = [];
+                gridBounds.forEach((b, idx) => {
+                    const rect = L.rectangle(b, {
+                        color: 'transparent',
+                        weight: 0,
+                        fillOpacity: 0,
+                        interactive: true
+                    }).addTo(map);
+
+                    rect.on('click', () => {
+                        if (!gameActive) return;
+                        if (isAdjacent(idx, emptyIndex, size)) {
+                            const movingPiece = pieces.find(p => p.currentIndex === idx);
+                            if (movingPiece) {
+                                movingPiece.overlay.setBounds(gridBounds[emptyIndex]);
+                                movingPiece.currentIndex = emptyIndex;
+                                emptyIndex = idx;
+                                checkWin();
+                            }
+                        }
+                    });
+
+                    rect._path.style.pointerEvents = 'auto';
+                    rect._path.style.touchAction = 'manipulation';
+                    clickRects.push(rect);
+                });
+
+                let time = 60;
+                document.getElementById('timer').textContent = `Time: ${time}s`;
+                timerInterval = setInterval(() => {
+                    time--;
+                    document.getElementById('timer').textContent = `Time: ${time}s`;
+                    if (time <= 0) endGame(false);
+                }, 1000);
+            }).catch(err => {
+                console.error(err);
+                alert("Failed to capture map image.");
+                gameActive = false;
+                document.getElementById('start').disabled = false;
+                document.getElementById('start').textContent = "Start Game";
+                document.getElementById('gridSize').disabled = false;
+                unlockMap();
+            });
+        });
+
+        function checkWin() {
+            const won = pieces.every(p => p.currentIndex === p.correctIndex);
+            if (won) endGame(true);
+        }
+
+        function endGame(won) {
+            clearInterval(timerInterval);
+            gameActive = false;
+            document.getElementById('message').textContent = won
+                ? "Great job! Puzzle solved!"
+                : "Time's up – try again!";
+            document.getElementById('start').textContent = "Play Again";
+            document.getElementById('start').disabled = false;
+            document.getElementById('gridSize').disabled = false;
+            unlockMap();
+        }
+    </script>
+</body>
+</html>
